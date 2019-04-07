@@ -29,8 +29,9 @@ class TestHTTPChannel(unittest.TestCase):
         inst = cls(server, sock, '127.0.0.1', adj, map=map)
         if outbuf is not None:
             inst.outbufs = deque([outbuf])
-            inst.total_outbufs_len = outbuf.__len__()
-            inst.current_outbuf_count = outbuf.__len__()
+            inst._scan_outbufs()
+            if outbuf.seekable:
+                inst.current_outbuf_count = outbuf.remaining
         inst.outbuf_lock = DummyLock()
         return inst, sock, map
 
@@ -40,7 +41,7 @@ class TestHTTPChannel(unittest.TestCase):
         self.assertEqual(inst.sendbuf_len, 2048)
         self.assertEqual(map[100], inst)
 
-    def test_total_outbufs_len_an_outbuf_size_gt_sys_maxint(self):
+    def test_known_outbufs_len_an_outbuf_size_gt_sys_maxint(self):
         from waitress.compat import MAXINT
         class DummyBuffer(object):
             chunks = []
@@ -51,15 +52,15 @@ class TestHTTPChannel(unittest.TestCase):
                 return MAXINT
         inst, _, map = self._makeOne()
         inst.outbufs = deque([DummyBuffer()])
-        inst.total_outbufs_len = 1
+        inst.known_outbufs_len = 1
         inst.write_soon(DummyData())
         # we are testing that this method does not raise an OverflowError
         # (see https://github.com/Pylons/waitress/issues/47)
-        self.assertEqual(inst.total_outbufs_len, MAXINT+1)
+        self.assertEqual(inst.known_outbufs_len, MAXINT + 1)
 
     def test_writable_something_in_outbuf(self):
         inst, sock, map = self._makeOne()
-        inst.total_outbufs_len = 3
+        inst.has_outbuf_data = True
         self.assertTrue(inst.writable())
 
     def test_writable_nothing_in_outbuf(self):
@@ -205,13 +206,13 @@ class TestHTTPChannel(unittest.TestCase):
         inst, sock, map = self._makeOne()
         wrote = inst.write_soon(b'')
         self.assertEqual(wrote, 0)
-        self.assertEqual(len(inst.outbufs[0]), 0)
+        self.assertEqual(inst.outbufs[0].remaining, 0)
 
     def test_write_soon_nonempty_byte(self):
         inst, sock, map = self._makeOne()
         wrote = inst.write_soon(b'a')
         self.assertEqual(wrote, 1)
-        self.assertEqual(len(inst.outbufs[0]), 1)
+        self.assertEqual(inst.outbufs[0].remaining, 1)
 
     def test_write_soon_filewrapper(self):
         from waitress.buffers import ReadOnlyFileBasedBuffer
@@ -249,24 +250,24 @@ class TestHTTPChannel(unittest.TestCase):
         wrote = inst.write_soon(b'xyz')
         self.assertEqual(wrote, 3)
         self.assertEqual(len(inst.outbufs), 2)
-        self.assertEqual(inst.outbufs[0].get(), b'')
-        self.assertEqual(inst.outbufs[1].get(), b'xyz')
+        self.assertEqual(inst.outbufs[0].read(), b'')
+        self.assertEqual(inst.outbufs[1].read(), b'xyz')
 
     def test_write_soon_waits_on_backpressure(self):
         inst, sock, map = self._makeOne()
         inst.adj.outbuf_high_watermark = 3
-        inst.total_outbufs_len = 4
+        inst.known_outbufs_len = 4
         inst.current_outbuf_count = 4
         class Lock(DummyLock):
             def wait(self):
-                inst.total_outbufs_len = 0
+                inst.known_outbufs_len = 0
                 super(Lock, self).wait()
         inst.outbuf_lock = Lock()
         wrote = inst.write_soon(b'xyz')
         self.assertEqual(wrote, 3)
         self.assertEqual(len(inst.outbufs), 2)
-        self.assertEqual(inst.outbufs[0].get(), b'')
-        self.assertEqual(inst.outbufs[1].get(), b'xyz')
+        self.assertEqual(inst.outbufs[0].read(), b'')
+        self.assertEqual(inst.outbufs[1].read(), b'xyz')
         self.assertTrue(inst.outbuf_lock.waited)
 
     def test_handle_write_notify_after_flush(self):
@@ -306,7 +307,7 @@ class TestHTTPChannel(unittest.TestCase):
     def test__flush_some_full_outbuf_socket_returns_nonzero(self):
         inst, sock, map = self._makeOne()
         inst.outbufs[0].append(b'abc')
-        inst.total_outbufs_len += 3
+        inst._scan_outbufs()
         result = inst._flush_some()
         self.assertEqual(result, True)
 
@@ -314,7 +315,7 @@ class TestHTTPChannel(unittest.TestCase):
         inst, sock, map = self._makeOne()
         sock.send = lambda x: False
         inst.outbufs[0].append(b'abc')
-        inst.total_outbufs_len += 3
+        inst._scan_outbufs()
         result = inst._flush_some()
         self.assertEqual(result, False)
 
@@ -323,10 +324,10 @@ class TestHTTPChannel(unittest.TestCase):
         sock.send = lambda x: len(x)
         buffer = DummyBuffer(b'abc')
         inst.outbufs.append(buffer)
-        inst.total_outbufs_len += len(buffer)
+        inst._scan_outbufs()
         result = inst._flush_some()
         self.assertEqual(result, True)
-        self.assertEqual(buffer.skipped, 3)
+        self.assertEqual(buffer.total_read, 3)
         self.assertEqual(len(inst.outbufs), 1)
         self.assertEqual(inst.outbufs[0], buffer)
 
@@ -335,14 +336,14 @@ class TestHTTPChannel(unittest.TestCase):
         sock.send = lambda x: len(x)
         buffer = DummyBuffer(b'abc')
         inst.outbufs.append(buffer)
-        inst.total_outbufs_len += len(buffer)
+        inst._scan_outbufs()
         inst.logger = DummyLogger()
         def doraise():
             raise NotImplementedError
         inst.outbufs[0].close = doraise
         result = inst._flush_some()
         self.assertEqual(result, True)
-        self.assertEqual(buffer.skipped, 3)
+        self.assertEqual(buffer.total_read, 3)
         self.assertEqual(len(inst.outbufs), 1)
         self.assertEqual(inst.outbufs[0], buffer)
         self.assertEqual(len(inst.logger.exceptions), 1)
@@ -350,14 +351,13 @@ class TestHTTPChannel(unittest.TestCase):
     def test__flush_some_outbuf_len_gt_sys_maxint(self):
         from waitress.compat import MAXINT
         class DummyHugeOutbuffer(object):
+            seekable = True
             def __init__(self):
-                self.length = MAXINT + 1
-            def __len__(self):
-                return self.length
-            def get(self, numbytes):
-                self.length = 0
+                self.remaining = MAXINT + 1
+            def read(self, numbytes, *args):
+                self.remaining = 0
                 return b'123'
-            def skip(self, *args): pass
+            def rollback(self, *args): pass
         inst, sock, map = self._makeOne(outbuf=DummyHugeOutbuffer())
         inst.send = lambda *arg: 0
         result = inst._flush_some()
@@ -481,7 +481,7 @@ class TestHTTPChannel(unittest.TestCase):
         inst.received(b'GET / HTTP/1.1\n\n')
         self.assertEqual(inst.request, preq)
         self.assertEqual(inst.server.tasks, [])
-        self.assertEqual(inst.outbufs[0].get(100), b'')
+        self.assertEqual(inst.outbufs[0].read(100), b'')
 
     def test_received_headers_finished_expect_continue_true(self):
         inst, sock, map = self._makeOne()
@@ -749,25 +749,29 @@ class DummyLock(object):
 
 class DummyBuffer(object):
     closed = False
+    total_read = 0
+    seekable = True
 
     def __init__(self, data, toraise=None):
-        self.data = data
+        self.buf = io.BytesIO(data)
+        self.remaining = len(data)
         self.toraise = toraise
 
-    def get(self, *arg):
+    def read(self, numbytes):
         if self.toraise:
             raise self.toraise
-        data = self.data
-        self.data = b''
+        data = self.buf.read(numbytes)
+        self.remaining -= len(data)
+        self.total_read += len(data)
         return data
 
-    def skip(self, num, x):
-        self.skipped = num
-
-    def __len__(self):
-        return len(self.data)
+    def rollback(self, numbytes):
+        self.buf.seek(-numbytes, 1)
+        self.remaining += numbytes
+        self.total_read -= numbytes
 
     def close(self):
+        self.remaining = 0
         self.closed = True
 
 class DummyAdjustments(object):

@@ -451,7 +451,7 @@ class WSGITask(Task):
             if app_iter.__class__ is ReadOnlyFileBasedBuffer:
                 cl = self.content_length
                 size = app_iter.prepare(cl)
-                if size:
+                if size > 0:
                     if cl != size:
                         if cl is not None:
                             self.remove_content_length_header()

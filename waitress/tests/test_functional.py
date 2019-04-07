@@ -75,6 +75,7 @@ class SubprocessTests(object):
         self.sock.close()
         # This give us one FD back ...
         self.queue.close()
+        self.proc.join()
 
     def assertline(self, line, status, reason, version):
         v, s, r = (x.strip() for x in line.split(None, 2))
