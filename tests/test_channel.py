@@ -173,7 +173,7 @@ class TestHTTPChannel(unittest.TestCase):
 
     def test_readable_with_requests(self):
         inst, sock, map = self._makeOneWithMap()
-        inst.requests = True
+        inst.requests = [True]
         self.assertEqual(inst.readable(), False)
 
     def test_handle_read_no_error(self):
@@ -189,8 +189,6 @@ class TestHTTPChannel(unittest.TestCase):
         self.assertEqual(L, [b"abc"])
 
     def test_handle_read_error(self):
-        import socket
-
         inst, sock, map = self._makeOneWithMap()
         inst.will_close = False
 
@@ -439,7 +437,7 @@ class TestHTTPChannel(unittest.TestCase):
         preq.completed = False
         preq.empty = True
         inst.received(b"GET / HTTP/1.1\r\n\r\n")
-        self.assertEqual(inst.requests, ())
+        self.assertEqual(inst.requests, [])
         self.assertEqual(inst.server.tasks, [])
 
     def test_received_preq_completed_empty(self):
@@ -525,14 +523,6 @@ class TestHTTPChannel(unittest.TestCase):
         self.assertEqual(inst.sent_continue, True)
         self.assertEqual(preq.completed, False)
 
-    def test_service_no_requests(self):
-        inst, sock, map = self._makeOneWithMap()
-        inst.requests = []
-        inst.service()
-        self.assertEqual(inst.requests, [])
-        self.assertTrue(inst.server.trigger_pulled)
-        self.assertTrue(inst.last_activity)
-
     def test_service_with_one_request(self):
         inst, sock, map = self._makeOneWithMap()
         request = DummyRequest()
@@ -560,6 +550,7 @@ class TestHTTPChannel(unittest.TestCase):
         request2 = DummyRequest()
         inst.task_class = DummyTaskClass()
         inst.requests = [request1, request2]
+        inst.service()
         inst.service()
         self.assertEqual(inst.requests, [])
         self.assertTrue(request1.serviced)
@@ -704,6 +695,80 @@ class TestHTTPChannel(unittest.TestCase):
         inst.cancel()
         self.assertEqual(inst.requests, [])
 
+    def app_check_disconnect(self, environ, start_response):
+        """
+        Application that checks for client disconnection every
+        second for up to five iterations.
+        """
+        import time
+
+        self.app_started.set()
+        self.disconnect_detected = False
+        check = environ["waitress.client_disconnected"]
+        for i in range(5):
+            if check():
+                self.disconnect_detected = True
+                break
+            time.sleep(1)
+
+        body = b"finished"
+        cl = str(len(body))
+        start_response(
+            "200 OK", [("Content-Length", cl), ("Content-Type", "text/plain")]
+        )
+        return [body]
+
+    def test_client_disconnect(self, close_before_start=False):
+        """Disconnect the socket after starting the task."""
+        import threading
+
+        adj = DummyAdjustments()
+        adj.channel_request_lookahead = 1
+        channel, sock, map = self._makeOneWithMap(adj=adj)
+        channel.server.application = self.app_check_disconnect
+
+        sock.send(
+            "\r\n".join(
+                [
+                    "GET / HTTP/1.1",
+                    "Host: localhost:8080",
+                    "Connection: keep-alive",
+                    "",
+                    "",
+                ]
+            ).encode("ascii")
+        )
+
+        # Read the request and add the task to the internal list
+        channel.handle_read()
+        self.assertEqual(len(channel.server.tasks), 1)
+
+        self.app_started = threading.Event()
+        thread = threading.Thread(target=channel.server.tasks[0].service)
+
+        if not close_before_start:
+            thread.start()
+            self.assertTrue(self.app_started.wait(timeout=5))
+
+        # Close the socket, check that the channel is still readable due to the
+        # lookahead and read it, which marks the channel as closed.
+        sock.close()
+        self.assertTrue(channel.readable())
+        channel.handle_read()
+
+        if close_before_start:
+            thread.start()
+
+        thread.join()
+
+        if close_before_start:
+            self.assertFalse(self.app_started.is_set())
+        else:
+            self.assertTrue(self.disconnect_detected)
+
+    def test_client_disconnect_immediate(self):
+        self.test_client_disconnect(close_before_start=True)
+
 
 class DummySock:
     blocking = False
@@ -730,6 +795,11 @@ class DummySock:
     def send(self, data):
         self.sent += data
         return len(data)
+
+    def recv(self, buffer_size):
+        result = self.sent[:buffer_size]
+        self.sent = self.sent[buffer_size:]
+        return result
 
 
 class DummyLock:
@@ -796,11 +866,15 @@ class DummyAdjustments:
     expose_tracebacks = True
     ident = "waitress"
     max_request_header_size = 10000
+    url_prefix = ""
+    channel_request_lookahead = 0
 
 
 class DummyServer:
     trigger_pulled = False
     adj = DummyAdjustments()
+    effective_port = 8080
+    server_name = ""
 
     def __init__(self):
         self.tasks = []
