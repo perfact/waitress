@@ -450,13 +450,14 @@ class HTTPChannel(wasyncore.dispatcher):
 
             request.close()
 
+            # Add new task to process the next request
+            with self.task_lock:
+                self.requests.pop(0)
+                if self.connected and self.requests:
+                    self.server.add_task(self)
+
         if self.connected:
             self.server.pull_trigger()
-            with self.task_lock:
-                if self.requests:
-                    self.requests.pop(0)
-                if self.requests:
-                    self.server.add_task(self)
 
         self.last_activity = time.time()
 
