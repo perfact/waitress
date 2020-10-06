@@ -1,6 +1,8 @@
 import io
 import unittest
 
+import pytest
+
 
 class TestHTTPChannel(unittest.TestCase):
     def _makeOne(self, sock, addr, adj, map=None):
@@ -695,21 +697,25 @@ class TestHTTPChannel(unittest.TestCase):
         inst.cancel()
         self.assertEqual(inst.requests, [])
 
+
+class TestHTTPChannelLookahead(TestHTTPChannel):
     def app_check_disconnect(self, environ, start_response):
         """
         Application that checks for client disconnection every
-        second for up to five iterations.
+        second for up to two seconds.
         """
         import time
 
-        self.app_started.set()
+        if hasattr(self, "app_started"):
+            self.app_started.set()
         self.disconnect_detected = False
         check = environ["waitress.client_disconnected"]
-        for i in range(5):
+        for i in range(3):
+            if i != 0:
+                time.sleep(1)
             if check():
                 self.disconnect_detected = True
                 break
-            time.sleep(1)
 
         body = b"finished"
         cl = str(len(body))
@@ -718,33 +724,40 @@ class TestHTTPChannel(unittest.TestCase):
         )
         return [body]
 
+    def _make_app_with_lookahead(self):
+        """
+        Setup a channel with lookahead and store it and the socket in self
+        """
+        adj = DummyAdjustments()
+        adj.channel_request_lookahead = 5
+        channel, sock, map = self._makeOneWithMap(adj=adj)
+        channel.server.application = self.app_check_disconnect
+
+        self.channel = channel
+        self.sock = sock
+
+    def _send(self, *lines):
+        """
+        Send lines through the socket with correct line endings
+        """
+        self.sock.send("".join(line + "\r\n" for line in lines).encode("ascii"))
+
     def test_client_disconnect(self, close_before_start=False):
         """Disconnect the socket after starting the task."""
         import threading
 
-        adj = DummyAdjustments()
-        adj.channel_request_lookahead = 1
-        channel, sock, map = self._makeOneWithMap(adj=adj)
-        channel.server.application = self.app_check_disconnect
-
-        sock.send(
-            "\r\n".join(
-                [
-                    "GET / HTTP/1.1",
-                    "Host: localhost:8080",
-                    "Connection: keep-alive",
-                    "",
-                    "",
-                ]
-            ).encode("ascii")
+        self._make_app_with_lookahead()
+        self._send(
+            "GET / HTTP/1.1",
+            "Host: localhost:8080",
+            "",
         )
-
-        # Read the request and add the task to the internal list
-        channel.handle_read()
-        self.assertEqual(len(channel.server.tasks), 1)
-
+        self.assertTrue(self.channel.readable())
+        self.channel.handle_read()
+        self.assertEqual(len(self.channel.server.tasks), 1)
         self.app_started = threading.Event()
-        thread = threading.Thread(target=channel.server.tasks[0].service)
+        self.disconnect_detected = False
+        thread = threading.Thread(target=self.channel.server.tasks[0].service)
 
         if not close_before_start:
             thread.start()
@@ -752,9 +765,9 @@ class TestHTTPChannel(unittest.TestCase):
 
         # Close the socket, check that the channel is still readable due to the
         # lookahead and read it, which marks the channel as closed.
-        sock.close()
-        self.assertTrue(channel.readable())
-        channel.handle_read()
+        self.sock.close()
+        self.assertTrue(self.channel.readable())
+        self.channel.handle_read()
 
         if close_before_start:
             thread.start()
@@ -767,7 +780,36 @@ class TestHTTPChannel(unittest.TestCase):
             self.assertTrue(self.disconnect_detected)
 
     def test_client_disconnect_immediate(self):
+        """
+        The same test, but this time we close the socket even before processing
+        started. The app should not be executed.
+        """
         self.test_client_disconnect(close_before_start=True)
+
+    @pytest.mark.xfail
+    def test_lookahead_continue(self):
+        """
+        Send two requests to a channel with lookahead and use an
+        expect-continue on the second one, making sure the responses still come
+        in the right order.
+        """
+        self._make_app_with_lookahead()
+        self._send(
+            "GET / HTTP/1.1",
+            "Host: localhost:8080",
+            "",
+            "GET / HTTP/1.1",
+            "Host: localhost:8080",
+            "Expect: 100-continue",
+            "",
+        )
+        self.channel.handle_read()
+        while self.channel.requests:
+            self.channel.server.tasks[0].service()
+        self.assertTrue(self.channel.writable())
+        self.channel.handle_write()
+        data = self.sock.recv(256).decode("ascii")
+        self.assertEqual(data.split("\r\n")[-1], "HTTP/1.1 100 Continue")
 
 
 class DummySock:
@@ -868,6 +910,7 @@ class DummyAdjustments:
     max_request_header_size = 10000
     url_prefix = ""
     channel_request_lookahead = 0
+    max_request_body_size = 1048576
 
 
 class DummyServer:
