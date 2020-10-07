@@ -40,7 +40,8 @@ class HTTPChannel(wasyncore.dispatcher):
     error_task_class = ErrorTask
     parser_class = HTTPRequestParser
 
-    request = None  # A request parser instance
+    # A request that has not been received yet completely is stored here
+    request = None
     last_activity = 0  # Time of last activity
     will_close = False  # set to True to close the socket.
     close_when_flushed = False  # set to True to close the socket when flushed
@@ -165,60 +166,66 @@ class HTTPChannel(wasyncore.dispatcher):
             # Client disconnected.
             self.connected = False
 
+    def send_continue(self):
+        """
+        Send a 100-Continue header to the client. This is either called from
+        receive (if no requests are running and the client expects it) or at
+        the end of service (if no more requests are queued and a request has
+        been read partially that expects it).
+        """
+        self.request.expect_continue = False
+        outbuf_payload = b"HTTP/1.1 100 Continue\r\n\r\n"
+        num_bytes = len(outbuf_payload)
+        self.outbufs[-1].append(outbuf_payload)
+        self.current_outbuf_count += num_bytes
+        self.total_outbufs_len += num_bytes
+        self.sent_continue = True
+        self._flush_some()
+        # Are we sure??
+        self.request.completed = False
+
     def received(self, data):
         """
         Receives input asynchronously and assigns one or more requests to the
         channel.
         """
-        request = self.request
-        requests = []
-
         if not data:
             return False
 
         while data:
-            if request is None:
-                request = self.parser_class(self.adj)
-            n = request.received(data)
+            if self.request is None:
+                self.request = self.parser_class(self.adj)
+            n = self.request.received(data)
 
-            if request.expect_continue and request.headers_finished:
-                # guaranteed by parser to be a 1.1 request
-                request.expect_continue = False
+            # if there are requests queued, we can not send the continue header
+            # yet since the responses need to be kept in order
+            with self.task_lock:
+                if (
+                    self.request.expect_continue
+                    and self.request.headers_finished
+                    and not self.requests
+                    and not self.sent_continue
+                ):
+                    self.send_continue()
 
-                if not self.sent_continue:
-                    outbuf_payload = b"HTTP/1.1 100 Continue\r\n\r\n"
-                    num_bytes = len(outbuf_payload)
-                    with self.outbuf_lock:
-                        self.outbufs[-1].append(outbuf_payload)
-                        self.current_outbuf_count += num_bytes
-                        self.total_outbufs_len += num_bytes
-                        self.sent_continue = True
-                        self._flush_some()
-                    request.completed = False
-
-            if request.completed:
+            if self.request.completed:
                 # The request (with the body) is ready to use.
-                self.request = None
+                self.sent_continue = False
 
-                if not request.empty:
-                    requests.append(request)
-                request = None
-            else:
-                self.request = request
+                if not self.request.empty:
+                    with self.task_lock:
+                        self.requests.append(self.request)
+                        if len(self.requests) == 1:
+                            # self.requests was empty before so the main thread
+                            # is in charge of starting the task. Otherwise,
+                            # service() will add a new task after each request
+                            # has been processed
+                            self.server.add_task(self)
+                self.request = None
 
             if n >= len(data):
                 break
             data = data[n:]
-
-        if requests:
-            with self.task_lock:
-                queue_was_empty = len(self.requests) == 0
-                self.requests.extend(requests)
-                if queue_was_empty:
-                    # requests was empty before so the main thread is in charge
-                    # of starting the task. Otherwise, service() will add a new
-                    # task after each request has been processed
-                    self.server.add_task(self)
 
         return True
 
@@ -455,6 +462,17 @@ class HTTPChannel(wasyncore.dispatcher):
                 self.requests.pop(0)
                 if self.connected and self.requests:
                     self.server.add_task(self)
+                elif (
+                    self.connected
+                    and self.request is not None
+                    and self.request.expect_continue
+                    and self.request.headers_finished
+                    and not self.sent_continue
+                ):
+                    # A request waits for a signal to continue, but we could
+                    # not send it until now because requests were being
+                    # processed and the output needs to be kept in order
+                    self.send_continue()
 
         if self.connected:
             self.server.pull_trigger()

@@ -710,12 +710,13 @@ class TestHTTPChannelLookahead(TestHTTPChannel):
             self.app_started.set()
         self.disconnect_detected = False
         check = environ["waitress.client_disconnected"]
-        for i in range(3):
-            if i != 0:
-                time.sleep(1)
-            if check():
-                self.disconnect_detected = True
-                break
+        if environ["PATH_INFO"] == "/sleep":
+            for i in range(3):
+                if i != 0:
+                    time.sleep(1)
+                if check():
+                    self.disconnect_detected = True
+                    break
 
         body = b"finished"
         cl = str(len(body))
@@ -748,7 +749,7 @@ class TestHTTPChannelLookahead(TestHTTPChannel):
 
         self._make_app_with_lookahead()
         self._send(
-            "GET / HTTP/1.1",
+            "GET /sleep HTTP/1.1",
             "Host: localhost:8080",
             "",
         )
@@ -786,7 +787,6 @@ class TestHTTPChannelLookahead(TestHTTPChannel):
         """
         self.test_client_disconnect(close_before_start=True)
 
-    @pytest.mark.xfail
     def test_lookahead_continue(self):
         """
         Send two requests to a channel with lookahead and use an
@@ -795,21 +795,30 @@ class TestHTTPChannelLookahead(TestHTTPChannel):
         """
         self._make_app_with_lookahead()
         self._send(
-            "GET / HTTP/1.1",
+            "POST / HTTP/1.1",
             "Host: localhost:8080",
+            "Content-Length: 1",
             "",
-            "GET / HTTP/1.1",
+            "x",
+            "POST / HTTP/1.1",
             "Host: localhost:8080",
+            "Content-Length: 1",
             "Expect: 100-continue",
             "",
         )
         self.channel.handle_read()
-        while self.channel.requests:
-            self.channel.server.tasks[0].service()
-        self.assertTrue(self.channel.writable())
-        self.channel.handle_write()
+        self.assertEqual(len(self.channel.requests), 1)
+        self.channel.server.tasks[0].service()
         data = self.sock.recv(256).decode("ascii")
-        self.assertEqual(data.split("\r\n")[-1], "HTTP/1.1 100 Continue")
+        self.assertTrue(data.endswith("HTTP/1.1 100 Continue\r\n\r\n"))
+
+        self.sock.send(b"x")
+        self.channel.handle_read()
+        self.assertEqual(len(self.channel.requests), 1)
+        self.channel.server.tasks[0].service()
+        self.channel._flush_some()
+        data = self.sock.recv(256).decode("ascii")
+        self.assertEqual(data.split("\r\n")[-1], "finished")
 
 
 class DummySock:
