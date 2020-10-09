@@ -708,6 +708,13 @@ class TestHTTPChannelLookahead(TestHTTPChannel):
 
         if hasattr(self, "app_started"):
             self.app_started.set()
+
+        try:
+            request_body_size = int(environ.get("CONTENT_LENGTH", 0))
+        except ValueError:
+            request_body_size = 0
+        self.request_body = environ["wsgi.input"].read(request_body_size)
+
         self.disconnect_detected = False
         check = environ["waitress.client_disconnected"]
         if environ["PATH_INFO"] == "/sleep":
@@ -819,6 +826,7 @@ class TestHTTPChannelLookahead(TestHTTPChannel):
         self.channel._flush_some()
         data = self.sock.recv(256).decode("ascii")
         self.assertEqual(data.split("\r\n")[-1], "finished")
+        self.assertEqual(self.request_body, b"x")
 
 
 class DummySock:

@@ -181,7 +181,6 @@ class HTTPChannel(wasyncore.dispatcher):
         self.total_outbufs_len += num_bytes
         self.sent_continue = True
         self._flush_some()
-        # Are we sure??
         self.request.completed = False
 
     def received(self, data):
